@@ -24,7 +24,9 @@ such as the T4, and fp32 on CPU. Training stages share MAX_WALLCLOCK_SECONDS
 import ast
 import glob
 import hashlib
+import inspect
 import io
+import json
 import math
 import os
 import subprocess
@@ -308,6 +310,355 @@ class TextVQVAE(nn.Module):
 
 
 # -----------------------------------------------------------------------------
+# Stage 2 model: NCM transformer (nanoNCM model.py, unchanged)
+#
+# A frozen multiscale residual VQ-VAE supplies discrete codes, coarse to fine.
+# codes[k] is a LongTensor of shape (B, level_lens[k]). The model predicts all
+# codes in one level in parallel, conditioned only on earlier levels.
+#
+# Training uses the original block-causal mask. Generation uses a preallocated
+# per-layer KV cache by default; use_cache=False provides a reference path.
+
+@dataclass
+class NCMConfig:
+    vocab_size: int = 4096
+    level_lens: tuple = (16, 64, 256)
+    n_embd: int = 384
+    n_head: int = 6
+    n_layer: int = 4
+    dropout: float = 0.0
+    bias: bool = False
+    level_loss_weighting: str = "token"  # "token" or "level"
+
+    def __post_init__(self):
+        for name in ("vocab_size", "n_embd", "n_head", "n_layer"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        self.level_lens = tuple(self.level_lens)
+        if not self.level_lens or any(
+            not isinstance(n, int) or isinstance(n, bool) or n <= 0
+            for n in self.level_lens
+        ):
+            raise ValueError("level_lens must contain positive integers")
+        if self.n_embd % self.n_head:
+            raise ValueError("n_embd must be divisible by n_head")
+        if not 0.0 <= self.dropout <= 1.0:
+            raise ValueError("dropout must be between 0 and 1")
+        if self.level_loss_weighting not in ("token", "level"):
+            raise ValueError("level_loss_weighting must be 'token' or 'level'")
+
+    @property
+    def num_levels(self):
+        return len(self.level_lens)
+
+    @property
+    def total_len(self):
+        return sum(self.level_lens)
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, ndim, bias):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim))
+        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+
+    def forward(self, x):
+        return F.layer_norm(x, self.weight.shape, self.weight, self.bias, 1e-5)
+
+
+class SelfAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+
+    def _qkv(self, x):
+        B, N, C = x.shape
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=-1)
+        return tuple(
+            t.view(B, N, self.n_head, C // self.n_head).transpose(1, 2)
+            for t in (q, k, v)
+        )
+
+    def _attend(self, q, k, v, mask=None):
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=mask,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=False,
+        )
+        B, _, N, _ = q.shape
+        y = y.transpose(1, 2).contiguous().view(B, N, self.n_embd)
+        return self.resid_dropout(self.c_proj(y))
+
+    def forward(self, x, mask):
+        return self._attend(*self._qkv(x), mask=mask)
+
+    def forward_cached(self, x, cache, start, total_len):
+        """Inference only: append a complete level to this layer's KV cache."""
+        q, k, v = self._qkv(x)
+        end = start + x.size(1)
+        if cache is None:
+            shape = (k.size(0), self.n_head, total_len, k.size(-1))
+            cache = (k.new_empty(shape), v.new_empty(shape))
+        keys, values = cache
+        keys[:, :, start:end].copy_(k)
+        values[:, :, start:end].copy_(v)
+
+        # Queries belong only to the current level. Every supplied key belongs
+        # to an earlier level or this level, so all are visible. A triangular
+        # token mask would incorrectly remove within-level attention.
+        return self._attend(q, keys[:, :, :end], values[:, :, :end]), cache
+
+
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.gelu = nn.GELU()
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        return self.dropout(self.c_proj(self.gelu(self.c_fc(x))))
+
+
+class Block(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = SelfAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
+
+    def forward(self, x, mask):
+        x = x + self.attn(self.ln_1(x), mask)
+        return x + self.mlp(self.ln_2(x))
+
+    def forward_cached(self, x, cache, start, total_len):
+        y, cache = self.attn.forward_cached(self.ln_1(x), cache, start, total_len)
+        x = x + y
+        return x + self.mlp(self.ln_2(x)), cache
+
+
+class NCMGPT(nn.Module):
+    def __init__(self, config: NCMConfig):
+        super().__init__()
+        self.config = config
+        C = config.n_embd
+        self.transformer = nn.ModuleDict(dict(
+            wte=nn.Embedding(config.vocab_size, C),
+            wpe=nn.Embedding(max(config.level_lens), C),
+            wle=nn.Embedding(config.num_levels, C),
+            drop=nn.Dropout(config.dropout),
+            h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f=LayerNorm(C, bias=config.bias),
+        ))
+        self.sos = nn.Parameter(torch.zeros(1, config.level_lens[0], C))
+        self.lm_head = nn.Linear(C, config.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight
+
+        lvl_id = torch.cat([
+            torch.full((n,), k, dtype=torch.long)
+            for k, n in enumerate(config.level_lens)
+        ])
+        pos_id = torch.cat([torch.arange(n) for n in config.level_lens])
+        mask = (lvl_id[None, :] <= lvl_id[:, None])[None, None]
+        self.register_buffer("lvl_id", lvl_id, persistent=False)
+        self.register_buffer("pos_id", pos_id, persistent=False)
+        self.register_buffer("ncm_mask", mask, persistent=False)
+
+        self.offsets = [0]
+        for n in config.level_lens:
+            self.offsets.append(self.offsets[-1] + n)
+
+        self.apply(self._init_weights)
+        for name, p in self.named_parameters():
+            if name.endswith("c_proj.weight"):
+                nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
+        nn.init.normal_(self.sos, mean=0.0, std=0.02)
+        print(f"number of parameters: {self.get_num_params() / 1e6:.2f}M")
+
+    def get_num_params(self, non_embedding=True):
+        n = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n -= self.transformer.wpe.weight.numel()
+        return n
+
+    @staticmethod
+    def _init_weights(module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    @staticmethod
+    def _resize(e, n):
+        if e.size(1) == n:
+            return e
+        return F.interpolate(e.transpose(1, 2), size=n, mode="nearest").transpose(1, 2)
+
+    def _level_input(self, embeddings, level, batch_size):
+        if level == 0:
+            return self.sos.expand(batch_size, -1, -1)
+        n = self.config.level_lens[level]
+        x = self._resize(embeddings[0], n)
+        for j in range(1, level):
+            # Resize every source directly to n. Repeatedly resizing an
+            # accumulated sum is not equivalent for arbitrary level lengths.
+            x = x + self._resize(embeddings[j], n)
+        return x
+
+    def _level_inputs(self, codes, upto, batch_size):
+        embeddings = [self.transformer.wte(codes[j]) for j in range(upto)]
+        return torch.cat([
+            self._level_input(embeddings, k, batch_size) for k in range(upto + 1)
+        ], dim=1)
+
+    def _add_positions(self, x, start, end):
+        x = x + self.transformer.wpe(self.pos_id[start:end])
+        x = x + self.transformer.wle(self.lvl_id[start:end])
+        return self.transformer.drop(x)
+
+    def _trunk(self, x, upto, current_only=False):
+        end = self.offsets[upto + 1]
+        x = self._add_positions(x, 0, end)
+        mask = self.ncm_mask[:, :, :end, :end]
+        for block in self.transformer.h:
+            x = block(x, mask)
+        if current_only:
+            x = x[:, self.offsets[upto]:end]
+        return self.lm_head(self.transformer.ln_f(x))
+
+    def _trunk_cached(self, x, level, caches):
+        start, end = self.offsets[level:level + 2]
+        x = self._add_positions(x, start, end)
+        for i, block in enumerate(self.transformer.h):
+            x, caches[i] = block.forward_cached(
+                x, caches[i], start, self.config.total_len
+            )
+        return self.lm_head(self.transformer.ln_f(x))
+
+    def _check_codes(self, codes):
+        if len(codes) != self.config.num_levels:
+            raise ValueError(f"expected {self.config.num_levels} levels, got {len(codes)}")
+        B = None
+        for k, (c, n) in enumerate(zip(codes, self.config.level_lens)):
+            if not isinstance(c, torch.Tensor) or c.ndim != 2:
+                raise ValueError(f"level {k}: expected a 2D tensor")
+            if B is None:
+                B = c.size(0)
+                if B == 0:
+                    raise ValueError("codes must have a nonempty batch")
+            if c.shape != (B, n):
+                raise ValueError(f"level {k}: expected {(B, n)}, got {tuple(c.shape)}")
+            if c.dtype != torch.long:
+                raise TypeError(f"level {k}: codes must have dtype torch.long")
+            if c.device != self.sos.device:
+                raise ValueError(f"level {k}: codes and model must be on the same device")
+        # Embedding and cross_entropy check ID bounds without extra per-level
+        # min/max reductions and GPU-to-CPU synchronization here.
+        return B
+
+    def forward(self, codes):
+        """Return (all-level logits, scalar loss, detached per-level losses)."""
+        B = self._check_codes(codes)
+        L = self.config.num_levels
+        x = self._level_inputs(codes, L - 1, B)
+        logits = self._trunk(x, L - 1)
+        targets = torch.cat(codes, dim=1)
+        ce = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)), targets.reshape(-1), reduction="none"
+        ).view(B, -1)
+        per_level = [
+            ce[:, self.offsets[k]:self.offsets[k + 1]].mean() for k in range(L)
+        ]
+        if self.config.level_loss_weighting == "token":
+            loss = ce.mean()
+        else:
+            loss = torch.stack(per_level).mean()
+        return logits, loss, [value.detach() for value in per_level]
+
+    @staticmethod
+    def _sample(logits, temperature, top_k, generator):
+        if temperature == 0 or top_k == 1:
+            return logits.argmax(dim=-1)
+        B, N, V = logits.shape
+        if top_k is not None and top_k < V:
+            values, indices = torch.topk(logits, top_k, dim=-1, sorted=False)
+            probs = F.softmax(values.float() / temperature, dim=-1)
+            picked = torch.multinomial(
+                probs.reshape(-1, top_k), 1, generator=generator
+            ).view(B, N, 1)
+            return indices.gather(-1, picked).squeeze(-1)
+        probs = F.softmax(logits.float() / temperature, dim=-1)
+        return torch.multinomial(
+            probs.reshape(-1, V), 1, generator=generator
+        ).view(B, N)
+
+    def generate(self, batch_size, temperature=1.0, top_k=None, *, use_cache=True, generator=None):
+        """
+        Generate K levels, sampling all positions in each level in parallel.
+
+        temperature=0 is greedy. top_k uses exactly k candidates, including
+        when logits tie at the cutoff; top_k >= vocab_size leaves all entries.
+        An optional torch.Generator must match the model's sampling device.
+        Evaluation mode is temporary and every module's mode is restored.
+        KV caches and code embeddings are local to this call.
+        """
+        if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer")
+        if not math.isfinite(temperature) or temperature < 0:
+            raise ValueError("temperature must be finite and nonnegative")
+        if top_k is not None and (
+            not isinstance(top_k, int) or isinstance(top_k, bool) or top_k <= 0
+        ):
+            raise ValueError("top_k must be a positive integer or None")
+
+        modes = [(module, module.training) for module in self.modules()]
+        self.eval()
+        try:
+            with torch.inference_mode():
+                codes, embeddings, inputs = [], [], []
+                caches = [None] * self.config.n_layer
+                for k in range(self.config.num_levels):
+                    x = self._level_input(embeddings, k, batch_size)
+                    if use_cache:
+                        logits = self._trunk_cached(x, k, caches)
+                    else:
+                        inputs.append(x)
+                        logits = self._trunk(torch.cat(inputs, dim=1), k, current_only=True)
+                    nxt = self._sample(logits, temperature, top_k, generator)
+                    codes.append(nxt)
+                    if k + 1 < self.config.num_levels:
+                        embeddings.append(self.transformer.wte(nxt))
+            # Preserve the original API's ordinary tensors: generated codes
+            # can be fed to a later training pass without inference-tensor errors.
+            with torch.inference_mode(False):
+                return [code.clone() for code in codes]
+        finally:
+            for module, training in modes:
+                module.training = training
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        params = [p for p in self.parameters() if p.requires_grad]
+        groups = [
+            {"params": [p for p in params if p.dim() >= 2], "weight_decay": weight_decay},
+            {"params": [p for p in params if p.dim() < 2], "weight_decay": 0.0},
+        ]
+        kwargs = {}
+        supports_fused = "fused" in inspect.signature(torch.optim.AdamW).parameters
+        if torch.device(device_type).type == "cuda" and supports_fused:
+            kwargs["fused"] = True
+        return torch.optim.AdamW(groups, lr=learning_rate, betas=betas, **kwargs)
+
+
+# -----------------------------------------------------------------------------
 # Data: byte260 shards -> document-aligned chunks
 
 def load_data_shard(file: Path) -> np.ndarray:
@@ -551,8 +902,18 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 
 
 def pack_int8(model):
-    """state dict -> (int8 + zlib blob, quantization stats)."""
-    quant_obj, stats = quantize_state_dict_int8(model.state_dict())
+    """state dict -> (int8 + zlib blob, quantization stats). Tied weights (NCM's wte and
+    lm_head) are stored once and re-tied by unpack_int8."""
+    state, aliases, seen = {}, {}, {}
+    for name, t in model.state_dict().items():
+        if t.data_ptr() in seen and t.shape == seen[t.data_ptr()][1].shape:
+            aliases[name] = seen[t.data_ptr()][0]
+        else:
+            seen[t.data_ptr()] = (name, t)
+            state[name] = t
+    quant_obj, stats = quantize_state_dict_int8(state)
+    if aliases:
+        quant_obj["aliases"] = aliases
     buf = io.BytesIO()
     torch.save(quant_obj, buf)
     return zlib.compress(buf.getvalue(), level=9), stats
@@ -561,7 +922,10 @@ def pack_int8(model):
 def unpack_int8(model, blob):
     """Load an int8 + zlib blob into model (the artifact round-trip)."""
     quant_state = torch.load(io.BytesIO(zlib.decompress(blob)), map_location="cpu")
-    model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    state = dequantize_state_dict_int8(quant_state)
+    for name, source in quant_state.get("aliases", {}).items():
+        state[name] = state[source]
+    model.load_state_dict(state, strict=True)
     return model
 
 
@@ -622,6 +986,95 @@ def format_tokenizer_report(name, r):
 
 
 # -----------------------------------------------------------------------------
+# Two-part evaluation
+#
+# NCM gives p(codes), not p(bytes). The encoder is deterministic, so sending a
+# chunk's codes and then its bytes given the codes is a valid code for the bytes:
+#     bits(chunk) = -log2 p_ncm(codes) - log2 p_decoder(bytes | all levels)
+# Code bits cover every code of a chunk (codes are a function of the padded chunk);
+# decoder bits cover real bytes only. Where a document ends is not free either:
+# each document pays an Elias-gamma code of (bytes + 1), 2*floor(log2(n + 1)) + 1 bits.
+#     val_bpb = (code bits + decoder bits + length bits) / real bytes
+
+def length_bits(doc_lens):
+    """Elias-gamma bits for every document's byte count + 1 (exact for counts < 2**53)."""
+    _, exponent = np.frexp(np.asarray(doc_lens, dtype=np.float64) + 1)   # = bit_length(n + 1)
+    return float((2 * exponent.astype(np.int64) - 1).sum())
+
+
+@torch.no_grad()
+def two_part_bits(tokenizer, ncm, data, batch_size, device, ctx, rank=0, world_size=1):
+    """Two-part code length of every chunk in data (split across ranks), in bits."""
+    offsets = ncm.offsets
+    L = len(offsets) - 1
+    code_nats = torch.zeros(L, dtype=torch.float64, device=device)
+    decoder_nats = torch.zeros((), dtype=torch.float64, device=device)
+    tokenizer.eval()
+    ncm.eval()
+    T = tokenizer.cfg.seq_len
+    lo, hi = len(data) * rank // world_size, len(data) * (rank + 1) // world_size
+    for start in range(lo, hi, batch_size):
+        end = min(start + batch_size, hi)
+        x = torch.from_numpy(data.chunks[start:end]).to(device=device, dtype=torch.long)
+        mask = byte_mask(torch.from_numpy(data.lens[start:end]).to(device=device, dtype=torch.long), T)
+        codes = tokenizer.encode(x)
+        with ctx:
+            logits, _, _ = ncm(codes)
+        nll = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)),
+                              torch.cat(codes, dim=1).reshape(-1), reduction="none").view(x.size(0), -1)
+        for k in range(L):
+            code_nats[k] += nll[:, offsets[k]:offsets[k + 1]].double().sum()
+        with ctx:
+            byte_logits = tokenizer.decode_logits(codes)
+        logp = F.log_softmax(byte_logits.float(), dim=-1).gather(-1, x[..., None]).squeeze(-1)
+        decoder_nats -= logp[mask].double().sum()
+    if distributed():
+        dist.all_reduce(code_nats)
+        dist.all_reduce(decoder_nats)
+    code_bits = (code_nats / math.log(2)).tolist()
+    decoder_bits = decoder_nats.item() / math.log(2)
+    len_bits = length_bits(data.doc_lens)
+    total = sum(code_bits) + decoder_bits + len_bits
+    return {"code_bits": code_bits, "decoder_bits": decoder_bits, "length_bits": len_bits,
+            "total_bits": total, "bytes": data.num_bytes, "val_bpb": total / data.num_bytes}
+
+
+def format_bits(name, r):
+    per_byte = lambda bits: bits / r["bytes"]
+    levels = " ".join(f"L{k}:{per_byte(b):.4f}" for k, b in enumerate(r["code_bits"]))
+    return (f"{name} val_bpb:{r['val_bpb']:.4f} | code bits/byte [{levels}] "
+            f"sum:{per_byte(sum(r['code_bits'])):.4f} | decoder:{per_byte(r['decoder_bits']):.4f} "
+            f"| length:{per_byte(r['length_bits']):.4f} | {r['bytes']:,} bytes")
+
+
+# -----------------------------------------------------------------------------
+# Artifact: both int8 + zlib blobs in one file
+
+ARTIFACT_MAGIC = b"NCM1"
+
+
+def write_artifact(path, vq_cfg, ncm_cfg, tokenizer_blob, ncm_blob):
+    header = json.dumps({"vq": asdict(vq_cfg), "ncm": asdict(ncm_cfg),
+                         "sizes": [len(tokenizer_blob), len(ncm_blob)]}).encode()
+    save_atomic(ARTIFACT_MAGIC + len(header).to_bytes(4, "little") + header + tokenizer_blob + ncm_blob, path)
+
+
+def read_artifact(path):
+    """-> (tokenizer, ncm) rebuilt on CPU from the artifact alone."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    if raw[:4] != ARTIFACT_MAGIC:
+        raise ValueError(f"{path} is not a nanoNCM artifact")
+    n = int.from_bytes(raw[4:8], "little")
+    header = json.loads(raw[8:8 + n])
+    a, b = header["sizes"]
+    blobs = raw[8 + n:8 + n + a], raw[8 + n + a:8 + n + a + b]
+    tokenizer = unpack_int8(TextVQVAE(VQConfig(**header["vq"])), blobs[0])
+    ncm = unpack_int8(NCMGPT(NCMConfig(**header["ncm"])), blobs[1])
+    return tokenizer, ncm
+
+
+# -----------------------------------------------------------------------------
 # Run
 
 class Hyperparameters:
@@ -637,8 +1090,9 @@ class Hyperparameters:
         self.device = env("DEVICE", "cuda" if cuda else "cpu")
         self.dtype = env("DTYPE", "auto")                 # auto | float32 | bfloat16 | float16
         self.num_threads = env("NUM_THREADS", min(4, torch.get_num_threads()))
-        self.stages = env("STAGES", "tokenizer")          # comma list; stage 2 + eval arrive in phase 3
+        self.stages = env("STAGES", "tokenizer,model,eval,sample")   # any subset, run in this order
         self.resume = env("RESUME", False)                # continue from checkpoints in out_dir
+        self.compile = env("COMPILE", False)              # torch.compile the NCM (off: T4-friendly)
         self.max_wallclock_seconds = float(env("MAX_WALLCLOCK_SECONDS", 600.0))   # all training; 0 = no cap
         self.stage1_fraction = env("STAGE1_FRACTION", 0.35)
         self.checkpoint_seconds = env("CHECKPOINT_SECONDS", 600)                 # 0 = only at evals
@@ -660,6 +1114,36 @@ class Hyperparameters:
         unknown = sorted(k for k in os.environ if k.startswith("VQ_") and k not in known)
         if unknown:
             raise ValueError(f"unknown setting(s): {unknown}")
+        # NCM training (train.py's settings; vocab_size and level_lens come from the tokenizer)
+        self.batch_size = env("BATCH_SIZE", 16)           # chunks per step, summed over GPUs
+        self.max_iters = env("MAX_ITERS", 1000)
+        self.eval_interval = env("EVAL_INTERVAL", 100)
+        self.eval_iters = env("EVAL_ITERS", 20)           # batches averaged per eval
+        self.log_interval = env("LOG_INTERVAL", 10)
+        self.learning_rate = env("LEARNING_RATE", 3e-4)
+        self.min_lr = env("MIN_LR", 3e-5)                 # cosine decays to this
+        self.warmup_iters = env("WARMUP_ITERS", 100)
+        self.weight_decay = env("WEIGHT_DECAY", 1e-2)
+        self.grad_clip = env("GRAD_CLIP", 1.0)            # 0 disables clipping
+        self.n_embd = env("N_EMBD", 256)
+        self.n_head = env("N_HEAD", 4)
+        self.n_layer = env("N_LAYER", 4)
+        self.dropout = env("DROPOUT", 0.0)
+        self.level_loss_weighting = env("LEVEL_LOSS_WEIGHTING", "token")   # or "level"
+        self.encode_batch_size = env("ENCODE_BATCH_SIZE", 256)   # chunks per encoder / eval batch
+        # sampling (generate.py's settings)
+        self.num_samples = env("NUM_SAMPLES", 4)
+        self.temperature = env("TEMPERATURE", 0.8)
+        self.top_k = env("TOP_K", 50)
+        for key in ("batch_size", "eval_interval", "eval_iters", "log_interval", "encode_batch_size",
+                    "n_embd", "n_head", "n_layer", "num_samples"):
+            value = getattr(self, key)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{key.upper()} must be a positive integer")
+        for key in ("max_iters", "warmup_iters"):
+            value = getattr(self, key)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{key.upper()} must be a nonnegative integer")
         for key in ("vq_batch_size", "vq_eval_interval", "vq_eval_iters", "num_threads", "vq_report_batch_size"):
             value = getattr(self, key)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -687,8 +1171,8 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     stages = {s.strip() for s in str(args.stages).split(",") if s.strip()}
-    if not stages <= {"tokenizer"}:
-        raise ValueError(f"STAGES={args.stages}: only 'tokenizer' exists so far")
+    if not stages <= {"tokenizer", "model", "eval", "sample"}:
+        raise ValueError(f"STAGES={args.stages}: choose from tokenizer, model, eval, sample")
 
     # distributed + device setup
     is_distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
@@ -784,11 +1268,15 @@ def main() -> None:
          f"balanced EMA {cfg.balance_levels}")
     log0(f"stage 1 budget: {f'{budget:.0f}s' if math.isfinite(budget) else 'no cap on'} training time, at most {args.vq_max_iters} iters "
          f"of {args.vq_batch_size} chunks")
-    stats = {"train_seconds": 0.0}
+    stage1_seconds = None
+    trained_tokenizer = False
 
-    if args.resume and os.path.exists(frozen_path):
+    if os.path.exists(frozen_path) and (args.resume or "tokenizer" not in stages):
         log0(f"resume: stage 1 already finished, loading {frozen_path}")
+    elif "tokenizer" not in stages:
+        raise FileNotFoundError(f"{frozen_path} is missing; include 'tokenizer' in STAGES")
     else:
+        trained_tokenizer = True
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.vq_learning_rate, weight_decay=0.01)
         scaler = torch.amp.GradScaler(device_type, enabled=(dtype == "float16"))
         train_generator = torch.Generator().manual_seed(args.seed + rank)
@@ -918,7 +1406,7 @@ def main() -> None:
             if it <= 10 or it % 100 == 0:
                 log0(f"vq iter {it:5d} | loss {loss.item():.4f} | rec {rec.item():.4f} | commit {commit.item():.4f} "
                      f"| lr {lr:.2e} | train_time {train_seconds + time.perf_counter() - t0:.0f}s")
-        stats["train_seconds"] = train_seconds
+        stage1_seconds = train_seconds
         if device_type == "cuda":
             log0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
         report = tokenizer_report(model, dev, args.vq_report_batch_size, device, ctx, rank, world_size)
@@ -934,23 +1422,284 @@ def main() -> None:
         barrier()
         del optimizer, ddp_model
 
+    del model
     with open(frozen_path, "rb") as f:
-        blob = f.read()
-    tokenizer = unpack_int8(TextVQVAE(cfg), blob).to(device).eval().requires_grad_(False)
-    tokenizer_sha256 = hashlib.sha256(blob).hexdigest()
-    log0(f"frozen tokenizer: {len(blob):,} bytes, sha256 {tokenizer_sha256}")
-    report = tokenizer_report(tokenizer, dev, args.vq_report_batch_size, device, ctx, rank, world_size)
-    log0(format_tokenizer_report("tokenizer dev (frozen, after int8)", report))
+        tokenizer_blob = f.read()
+    tokenizer = unpack_int8(TextVQVAE(cfg), tokenizer_blob).to(device).eval().requires_grad_(False)
+    tokenizer_sha256 = hashlib.sha256(tokenizer_blob).hexdigest()
+    log0(f"frozen tokenizer: {len(tokenizer_blob):,} bytes, sha256 {tokenizer_sha256}")
+    if stage1_seconds is None:
+        stage1_seconds = 0.0
+        if os.path.exists(last_path):
+            stage1_seconds = torch.load(last_path, map_location="cpu", weights_only=True)["train_seconds"]
+        else:
+            log0(f"WARNING: no {last_path}; stage 1 training time unknown, counted as 0")
+    if trained_tokenizer:
+        report = tokenizer_report(tokenizer, dev, args.vq_report_batch_size, device, ctx, rank, world_size)
+        log0(format_tokenizer_report("tokenizer dev (frozen, after int8)", report))
+        # one reconstruction, as vq_tokenizer.py printed
+        if master_process:
+            x = torch.from_numpy(dev.chunks[:1]).to(device=device, dtype=torch.long)
+            n = int(dev.lens[0])
+            codes = tokenizer.encode(x)
+            log0("\n--- original ---\n" + bytes(dev.chunks[0, :n]).decode("utf-8", errors="replace"))
+            for k in range(len(codes)):
+                recon = tokenizer.decode(codes[:k + 1])[0, :n].tolist()
+                log0(f"\n--- reconstructed from levels 0..{k} ---\n" + bytes(recon).decode("utf-8", errors="replace"))
 
-    # one reconstruction, as vq_tokenizer.py printed
-    if master_process:
-        x = torch.from_numpy(dev.chunks[:1]).to(device=device, dtype=torch.long)
-        n = int(dev.lens[0])
-        codes = tokenizer.encode(x)
-        log0("\n--- original ---\n" + bytes(dev.chunks[0, :n]).decode("utf-8", errors="replace"))
-        for k in range(len(codes)):
-            recon = tokenizer.decode(codes[:k + 1])[0, :n].tolist()
-            log0(f"\n--- reconstructed from levels 0..{k} ---\n" + bytes(recon).decode("utf-8", errors="replace"))
+    # -------------------------------------------------------------------------
+    # Stage 2: NCM on the frozen tokenizer's codes (train.py)
+
+    config = NCMConfig(
+        vocab_size=cfg.codebook_size,
+        level_lens=cfg.level_lens,
+        n_embd=args.n_embd,
+        n_head=args.n_head,
+        n_layer=args.n_layer,
+        dropout=args.dropout,
+        level_loss_weighting=args.level_loss_weighting,
+    )
+    artifact_path = os.path.join(args.out_dir, "final_model.int8.ptz")
+    ncm_last_path = os.path.join(args.out_dir, "last.pt")
+    ncm_best_path = os.path.join(args.out_dir, "ckpt.pt")
+    code_bytes = len(code.encode("utf-8"))
+
+    if "model" in stages and args.resume and os.path.exists(artifact_path):
+        log0(f"resume: stage 2 already finished, using {artifact_path}")
+    elif "model" in stages:
+        if args.batch_size % world_size:
+            raise ValueError("BATCH_SIZE must be divisible by the number of GPUs")
+        local_batch = args.batch_size // world_size
+        budget = args.max_wallclock_seconds - stage1_seconds if args.max_wallclock_seconds > 0 else math.inf
+        log0(f"stage 2 budget: {f'{budget:.0f}s' if math.isfinite(budget) else 'no cap on'} training time "
+             f"(encoding included), at most {args.max_iters} iters of {args.batch_size} chunks")
+
+        # Encode the training data in memory with the frozen tokenizer (data/prepare_ncm.py):
+        # aligned uint16 arrays, one per level; row i of every level is the same chunk.
+        def encode_all(data, lo, hi):
+            arrays = [np.empty((hi - lo, n), dtype=np.uint16) for n in cfg.level_lens]
+            for start in range(lo, hi, args.encode_batch_size):
+                end = min(start + args.encode_batch_size, hi)
+                x = torch.from_numpy(data.chunks[start:end]).to(device=device, dtype=torch.long)
+                for array, c in zip(arrays, tokenizer.encode(x)):
+                    array[start - lo:end - lo] = c.cpu().numpy().astype(np.uint16)
+            return arrays
+
+        if device_type == "cuda":
+            torch.cuda.synchronize()
+        t_encode = time.perf_counter()
+        data = {"train": encode_all(train, len(train) * rank // world_size, len(train) * (rank + 1) // world_size),
+                "dev": encode_all(dev, 0, len(dev))}
+        encode_seconds = sync_max(time.perf_counter() - t_encode)
+        log0(f"encoded {len(train):,} train chunks (this GPU: {data['train'][0].shape[0]:,}) and "
+             f"{len(dev):,} dev chunks in {encode_seconds:.1f}s")
+
+        def get_batch(split):
+            """Returns a list of K LongTensors, codes[k] of shape (local batch, level_lens[k])."""
+            arrays = data[split]
+            ix = np.random.randint(0, arrays[0].shape[0], size=local_batch)
+            codes = [torch.from_numpy(a[ix].astype(np.int64)) for a in arrays]   # same rows across levels
+            if device_type == "cuda":
+                return [c.pin_memory().to(device, non_blocking=True) for c in codes]
+            return [c.to(device) for c in codes]
+
+        log0(f"Setting up model on {device} ({dtype}{', GradScaler' if dtype == 'float16' else ''})...")
+        ncm = NCMGPT(config).to(device)
+        optimizer = ncm.configure_optimizers(args.weight_decay, args.learning_rate, (0.9, 0.95), device_type)
+        # fp16 has a narrow exponent range, so its gradients need loss scaling
+        scaler = torch.amp.GradScaler(device_type, enabled=(dtype == "float16"))
+        start_iter, train_seconds, best_val_loss = 0, 0.0, float("inf")
+        if args.resume and os.path.exists(ncm_last_path):
+            checkpoint = torch.load(ncm_last_path, map_location=device, weights_only=True)
+            if checkpoint["tokenizer_sha256"] != tokenizer_sha256:
+                raise ValueError("resume: checkpoint was trained on codes from a different tokenizer")
+            if checkpoint["config"] != asdict(config) or checkpoint["world_size"] != world_size:
+                raise ValueError("resume: last.pt has a different NCM config or GPU count")
+            ncm.load_state_dict(checkpoint["model"])
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            scaler.load_state_dict(checkpoint["scaler"])
+            rng = checkpoint["rng"][rank]
+            torch.set_rng_state(rng["torch"].cpu())
+            np.random.set_state(("MT19937", np.array(rng["numpy"], dtype=np.uint32), *rng["numpy_pos"]))
+            start_iter, train_seconds = checkpoint["iter"], checkpoint["train_seconds"]
+            best_val_loss = checkpoint["best_val_loss"]
+            log0(f"resume: NCM from {ncm_last_path} at iter {start_iter} ({train_seconds:.0f}s trained, "
+                 f"best dev {best_val_loss:.4f})")
+            checkpoint = None             # free memory
+        train_seconds += encode_seconds   # every encoding pass is training compute
+        log0(f"NCM: {sum(p.numel() for p in ncm.parameters()):,} parameters, n_layer {config.n_layer}, "
+             f"n_head {config.n_head}, n_embd {config.n_embd}, vocab {config.vocab_size}")
+        model = torch.compile(ncm) if args.compile else ncm
+        if is_distributed:
+            model = DDP(model, device_ids=[local_rank] if device_type == "cuda" else None)
+
+        def get_lr(it, progress):
+            """Linear warmup, then cosine decay to min_lr (over iterations, or the time budget if shorter)."""
+            if it < args.warmup_iters:
+                return args.learning_rate * (it + 1) / (args.warmup_iters + 1)
+            ratio = max((it - args.warmup_iters) / max(1, args.max_iters - args.warmup_iters), progress)
+            return args.min_lr + 0.5 * (1.0 + math.cos(math.pi * min(ratio, 1.0))) * (args.learning_rate - args.min_lr)
+
+        @torch.no_grad()
+        def estimate_loss():
+            """Average loss (and per-level losses) over eval_iters batches for each split."""
+            ncm.eval()
+            out = {}
+            for split in ("train", "dev"):
+                total = torch.zeros(1 + config.num_levels, device=device)
+                for _ in range(args.eval_iters):
+                    with ctx:
+                        _, loss, levels = ncm(get_batch(split))
+                    total += torch.stack([loss.float()] + [l.float() for l in levels])
+                if is_distributed:
+                    dist.all_reduce(total)
+                out[split] = (total / (args.eval_iters * world_size)).cpu()
+            ncm.train()
+            return out
+
+        def save_checkpoint(path, it):
+            """Write to a temp file first so an interrupted session never leaves a broken checkpoint."""
+            np_state = np.random.get_state()
+            rng = {"torch": torch.get_rng_state(), "numpy": np_state[1].tolist(), "numpy_pos": list(np_state[2:])}
+            rngs = [rng]
+            if is_distributed:
+                rngs = [None] * world_size
+                dist.all_gather_object(rngs, rng)
+            if master_process:
+                save_atomic({
+                    "model": ncm.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scaler": scaler.state_dict(),
+                    "config": asdict(config),
+                    "iter": it,
+                    "train_seconds": train_seconds,
+                    "best_val_loss": best_val_loss,
+                    "tokenizer_sha256": tokenizer_sha256,
+                    "world_size": world_size,
+                    "rng": rngs,
+                }, path)
+            barrier()
+
+        log0("Starting training...")
+        ncm.train()
+        it = start_iter
+        last_save = train_seconds
+        iters_since_log = 0
+        if device_type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        t_log = t0
+        while True:
+            elapsed = sync_max(train_seconds + time.perf_counter() - t0)
+            done = it >= args.max_iters or elapsed >= budget
+            # evaluation + checkpoint (skipped on the step we resumed at: it was evaluated before saving)
+            if (it % args.eval_interval == 0 or done) and not (args.resume and it == start_iter and it > 0):
+                train_seconds = elapsed
+                t_eval = time.perf_counter()
+                losses = estimate_loss()
+                lv = ", ".join(f"L{k}:{v:.3f}" for k, v in enumerate(losses["dev"][1:].tolist()))
+                log0(f"step {it:5d} | train {losses['train'][0]:.4f} | dev {losses['dev'][0]:.4f} | "
+                     f"dev levels [{lv}] | eval {(time.perf_counter() - t_eval) * 1000:.0f} ms "
+                     f"| train_time {train_seconds:.0f}s")
+                if losses["dev"][0] < best_val_loss:
+                    best_val_loss = losses["dev"][0].item()
+                    save_checkpoint(ncm_best_path, it)
+                save_checkpoint(ncm_last_path, it)
+                last_save = train_seconds
+                t0 = t_log = time.perf_counter()   # eval and saving are not training time
+                iters_since_log = 0
+            elif args.checkpoint_seconds and elapsed - last_save >= args.checkpoint_seconds:
+                train_seconds = elapsed
+                save_checkpoint(ncm_last_path, it)
+                last_save = train_seconds
+                log0(f"step {it:5d} | checkpoint saved to {ncm_last_path}")
+                t0 = t_log = time.perf_counter()
+                iters_since_log = 0
+            if done:
+                if it < args.max_iters:
+                    log0(f"stopping_early: wallclock_cap train_time:{train_seconds:.0f}s step:{it}/{args.max_iters}")
+                break
+
+            lr = get_lr(it, elapsed / budget if math.isfinite(budget) else 0.0)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
+            codes = get_batch("train")
+            with ctx:
+                _, loss, _ = model(codes)
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            if args.grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(ncm.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            it += 1
+            iters_since_log += 1
+            # logging (loss.item() syncs the GPU, so the timing is real)
+            if it % args.log_interval == 0:
+                lossf = loss.item()
+                dt = (time.perf_counter() - t_log) / iters_since_log
+                t_log = time.perf_counter()
+                iters_since_log = 0
+                log0(f"iter {it:5d} | loss {lossf:.4f} | lr {lr:.2e} | {dt * 1000:.1f} ms/iter")
+
+        log0(f"training_time total:{stage1_seconds + train_seconds:.0f}s (tokenizer {stage1_seconds:.0f}s, "
+             f"encoding {encode_seconds:.0f}s, NCM {train_seconds - encode_seconds:.0f}s) | best dev {best_val_loss:.4f}")
+        if device_type == "cuda":
+            log0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+                 f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB")
+
+        # Serialization: the artifact holds the frozen tokenizer blob unchanged and the
+        # NCM's final weights as int8 + zlib, like the baseline's final_model.int8.ptz.
+        ncm_blob, qstats = pack_int8(ncm)
+        if master_process:
+            write_artifact(artifact_path, cfg, config, tokenizer_blob, ncm_blob)
+            log0(f"Serialized NCM int8+zlib: {len(ncm_blob):,} bytes (payload {qstats['int8_payload_bytes']:,})")
+        barrier()
+        del data, model, ncm, optimizer
+
+    if os.path.exists(artifact_path):
+        artifact_bytes = os.path.getsize(artifact_path)
+        log0(f"Serialized model int8+zlib: {artifact_bytes:,} bytes (tokenizer {len(tokenizer_blob):,} + NCM + header)")
+        log0(f"Code size: {code_bytes:,} bytes")
+        log0(f"Total submission size int8+zlib: {artifact_bytes + code_bytes:,} bytes "
+             f"({'within' if artifact_bytes + code_bytes <= 16_000_000 else 'OVER'} the 16,000,000-byte limit)")
+
+    # -------------------------------------------------------------------------
+    # Evaluation after the artifact round trip, and samples
+
+    if stages & {"eval", "sample"}:
+        if not os.path.exists(artifact_path):
+            raise FileNotFoundError(f"{artifact_path} is missing; include 'model' in STAGES")
+        tok_rt, ncm_rt = read_artifact(artifact_path)
+        tok_rt, ncm_rt = tok_rt.to(device).eval(), ncm_rt.to(device).eval()
+
+    if "eval" in stages:
+        # The val split is read here and nowhere else.
+        val, n_val_files = load_chunks(os.path.join(args.data_path, "fineweb_val_*.bin"), cfg.seq_len)
+        log0(f"val: {n_val_files} file(s), {len(val.doc_lens):,} docs, {val.num_bytes:,} bytes, {len(val):,} chunks")
+        if device_type == "cuda":
+            torch.cuda.synchronize()
+        t_eval = time.perf_counter()
+        result = two_part_bits(tok_rt, ncm_rt, val, args.encode_batch_size, device, ctx, rank, world_size)
+        eval_seconds = time.perf_counter() - t_eval
+        log0(format_bits("final_int8_zlib_roundtrip", result) + f" | eval_time:{eval_seconds * 1000:.0f}ms")
+        log0(f"final_int8_zlib_roundtrip_exact val_bpb:{result['val_bpb']:.8f}")
+        if master_process:
+            with open(os.path.join(args.out_dir, "eval.json"), "w") as f:
+                json.dump({**result, "eval_seconds": eval_seconds, "bytes_code": code_bytes,
+                           "bytes_model_int8_zlib": os.path.getsize(artifact_path),
+                           "bytes_total": os.path.getsize(artifact_path) + code_bytes,
+                           "tokenizer_sha256": tokenizer_sha256, "world_size": world_size,
+                           "gpu": torch.cuda.get_device_name(device) if device_type == "cuda" else "cpu"}, f, indent=2)
+
+    if "sample" in stages and master_process:
+        # generate.py: sample codes level by level, then decode them to bytes
+        generator = torch.Generator(device=device).manual_seed(args.seed)
+        codes = ncm_rt.generate(args.num_samples, args.temperature, args.top_k, generator=generator)
+        for i, row in enumerate(tok_rt.decode(codes).cpu().tolist()):
+            log0(f"\n--- sample {i + 1} (temperature {args.temperature}, top_k {args.top_k}) ---\n"
+                 + bytes(row).decode("utf-8", errors="replace"))
 
     if is_distributed:
         dist.destroy_process_group()

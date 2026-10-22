@@ -23,6 +23,8 @@ TINY = {
     "VQ_SEQ_LEN": "16", "VQ_LEVEL_LENS": "(2,4,16)", "VQ_CODEBOOK_SIZE": "32", "VQ_CODE_DIM": "4",
     "VQ_N_EMBD": "16", "VQ_N_HEAD": "2", "VQ_N_LAYER": "1", "VQ_BATCH_SIZE": "4",
     "VQ_EVAL_INTERVAL": "2", "VQ_EVAL_ITERS": "1", "VQ_WARMUP_ITERS": "1", "VQ_REPORT_BATCH_SIZE": "8",
+    "N_EMBD": "16", "N_HEAD": "2", "N_LAYER": "1", "BATCH_SIZE": "4", "EVAL_INTERVAL": "2", "EVAL_ITERS": "1",
+    "WARMUP_ITERS": "1", "LOG_INTERVAL": "1", "ENCODE_BATCH_SIZE": "8", "NUM_SAMPLES": "2",
 }
 
 
@@ -138,7 +140,7 @@ class StageOneTests(unittest.TestCase):
 
     def settings(self, name, **extra):
         return {**TINY, "DATA_PATH": str(self.data), "OUT_DIR": str(self.root / name),
-                "LOG_DIR": str(self.root / "logs"), "RUN_ID": name, **extra}
+                "LOG_DIR": str(self.root / "logs"), "RUN_ID": name, "STAGES": "tokenizer", **extra}
 
     def test_train_freeze_and_resume(self):
         out = run([str(ROOT / "train_gpt.py")], env=self.settings("run", VQ_MAX_ITERS="3"))
@@ -165,9 +167,41 @@ class StageOneTests(unittest.TestCase):
 
     def test_torchrun_two_processes(self):
         out = run(["-m", "torch.distributed.run", "--standalone", "--nproc_per_node=2", str(ROOT / "train_gpt.py")],
-                  env=self.settings("ddp", VQ_MAX_ITERS="3"))
+                  env=self.settings("ddp", VQ_MAX_ITERS="3", MAX_ITERS="3", STAGES="tokenizer,model,eval,sample"))
         self.assertIn("world_size:2", out)
         self.assertIn("tokenizer dev (frozen, after int8)", out)
+        self.assertIn("final_int8_zlib_roundtrip val_bpb:", out)
+        self.assertEqual(json.loads((self.root / "ddp" / "eval.json").read_text())["world_size"], 2)
+
+    def test_all_stages_resume_and_reproducible_eval(self):
+        full = self.settings("all", VQ_MAX_ITERS="3", MAX_ITERS="3", STAGES="tokenizer,model,eval,sample")
+        out = run([str(ROOT / "train_gpt.py")], env=full)
+        for expected in ("encoded", "Starting training", "training_time total:", "Serialized NCM int8+zlib",
+                         "Total submission size int8+zlib", "final_int8_zlib_roundtrip val_bpb:",
+                         "code bits/byte [L0:", "| decoder:", "| length:", "--- sample 1", "--- sample 2"):
+            self.assertIn(expected, out)
+        result = json.loads((self.root / "all" / "eval.json").read_text())
+        self.assertAlmostEqual(result["val_bpb"], result["total_bits"] / result["bytes"], places=12)
+        self.assertEqual(result["bytes"], json.loads((self.data / "bytes_manifest.json").read_text())["val"]["bytes"])
+        self.assertEqual(result["bytes_total"], result["bytes_model_int8_zlib"] + result["bytes_code"])
+        exact = [l for l in out.splitlines() if l.startswith("final_int8_zlib_roundtrip_exact")]
+        # evaluation alone, from the artifact on disk, gives the identical number
+        again = run([str(ROOT / "train_gpt.py")], env={**full, "STAGES": "eval"})
+        self.assertEqual(exact, [l for l in again.splitlines() if l.startswith("final_int8_zlib_roundtrip_exact")])
+        self.assertNotIn("Starting training", again)
+        # an interrupted stage 2 resumes from last.pt and reuses the frozen tokenizer
+        (self.root / "all" / "final_model.int8.ptz").unlink()
+        out = run([str(ROOT / "train_gpt.py")], env={**full, "RESUME": "True", "MAX_ITERS": "5"})
+        self.assertIn("stage 1 already finished", out)
+        self.assertIn("resume: NCM from", out)
+        self.assertIn("at iter 3", out)
+        self.assertIn("iter     5", out)
+
+    def test_val_is_read_only_by_eval(self):
+        out = run([str(ROOT / "train_gpt.py")], env=self.settings("noval", VQ_MAX_ITERS="2", MAX_ITERS="2",
+                                                                 STAGES="tokenizer,model"))
+        self.assertNotIn("val:", out)
+        self.assertNotIn("val_bpb", out)
 
 
 class NotebookTests(unittest.TestCase):
